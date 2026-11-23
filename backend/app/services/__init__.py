@@ -22,6 +22,8 @@ from app.services.scheduler import SchedulerService
 from app.services.crawl_cost import CrawlCostService
 from app.services.data_archive import DataArchiveService
 from app.services.diff_check import DiffCheckService
+from app.services.scan_batch import ScanBatchService
+from app.services.batch_consume import BatchConsumeService
 from app.services.export_task import ExportTaskService
 from app.services.audit_log import AuditLogService
 
@@ -46,6 +48,8 @@ SERVICES: dict[str, BaseModuleService] = {
     "crawl_cost": CrawlCostService(),
     "data_archive": DataArchiveService(),
     "diff_check": DiffCheckService(),
+    "scan_batch": ScanBatchService(),
+    "batch_consume": BatchConsumeService(),
     "export_task": ExportTaskService(),
     "audit_log": AuditLogService(),
 }

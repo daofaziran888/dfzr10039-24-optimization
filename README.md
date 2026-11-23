@@ -70,6 +70,8 @@ npm run dev
 | 采集计费 | `crawl_cost` | 用量记录 | 记录编号、采集站点、计费周期 |
 | 数据归档 | `data_archive` | 归档策略 | 策略编号、数据范围、归档周期 |
 | 差异检测 | `diff_check` | 差异记录 | 记录编号、目标站点、检测页面 |
+| 扫描批次确认 | `scan_batch` | 扫描批次 | 批次编号、目标站点、续扫游标、扫描快照、确认序号 |
+| 批次消费台账 | `batch_consume` | 消费记录 | 消费编号、目标站点、批次编号、扫描快照 |
 | 导出任务 | `export_task` | 导出记录 | 记录编号、数据来源、导出格式 |
 | 操作审计 | `audit_log` | 审计记录 | 记录编号、操作模块、操作人 |
 
@@ -80,6 +82,26 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 增量扫描批次确认（断点续跑）
+
+增量扫描的「写差异、确认进度、断点续跑、下游消费」共用同一份批次确认台账
+（`app/services/scan_batch.py`，表 `scan_batch` / `scan_change` / `batch_consume`），
+不再依赖进程内游标，工位刷新或进程重启后可凭台账续跑。
+
+1. **认领扫描** `POST /api/scan-batches/claim`：按站点 + 基线 + 输入计算扫描快照哈希，
+   差异先落 `scan_change` 并留输入快照。同一输入重复认领（重启续跑）返回原批次，
+   已发出的差异保留原编号、持续可读，只累加`认领次数`，不产生第二份变动。
+2. **确认批次** `POST /api/scan-batches/{batch_id}/confirm`：续扫游标只在确认时落库推进
+   （同步 `incr_crawl` 读位），结论同步写入 `diff_check`。同一站点按确认序号 FIFO，
+   后一批不能越过更早的待确认批次；不同站点的读位互不影响，
+   可用 `GET /api/scan-batches/positions/{site}` 单独查询。
+3. **下游消费** `POST /api/scan-batches/{batch_id}/consume`：实际发送本批获准读取的
+   新增/修改/删除，并在 `batch_consume` 登记站点、批次与扫描快照作为交付证据。
+   前一批没有消费记录时后一批会被拒绝（不能跳过前批报进度）；同一批次重复消费幂等，
+   消费端每项变动只收到一次。
+4. 续跑视图 `GET /api/scan-batches/resume`，差异清单取数口
+   `GET /api/scan-batches/diff-checklist`，前端工作台在「扫描批次确认台」（`/scan-batches`）。
 
 领域：数据工程
 子方向：数据采集、爬虫与RPA

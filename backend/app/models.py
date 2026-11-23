@@ -584,6 +584,8 @@ class DiffRecord:
     affected_fields: list[str] = field(default_factory=list)
     detected_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     status: str = "已检测"
+    batch_id: str = ""
+    snapshot_hash: str = ""
 
     @classmethod
     def from_seed_row(cls, row: dict[str, Any]) -> DiffRecord:
@@ -597,6 +599,149 @@ class DiffRecord:
             affected_fields=[str(row.get("影响字段", ""))] if row.get("影响字段") else [],
             detected_at=str(row.get("检测时间", "")),
             status=str(row.get("status", "已检测")),
+            batch_id=str(row.get("批次编号", "")),
+            snapshot_hash=str(row.get("扫描快照", "")),
+        )
+
+
+# 增量扫描批次确认的三类变更口径，差异台账与下游消费共用同一份枚举。
+SCAN_CHANGE_ADDED = "新增"
+SCAN_CHANGE_UPDATED = "修改"
+SCAN_CHANGE_REMOVED = "删除"
+
+
+@dataclass
+class ScanChange:
+    """扫描批次内的单条变动：编号在重复认领时保持稳定，差异台账沿用同一编号。"""
+    change_id: str
+    batch_id: str
+    target_site: str
+    page_key: str
+    change_type: str
+    old_payload: dict[str, Any] = field(default_factory=dict)
+    new_payload: dict[str, Any] = field(default_factory=dict)
+    snapshot_hash: str = ""
+    detected_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    status: str = "待确认"
+
+    def to_row(self) -> dict[str, Any]:
+        return {
+            "变更编号": self.change_id,
+            "批次编号": self.batch_id,
+            "目标站点": self.target_site,
+            "检测页面": self.page_key,
+            "变更类型": self.change_type,
+            "旧内容摘要": json.dumps(self.old_payload, ensure_ascii=False, sort_keys=True),
+            "新内容摘要": json.dumps(self.new_payload, ensure_ascii=False, sort_keys=True),
+            "扫描快照": self.snapshot_hash,
+            "检测时间": self.detected_at,
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "ScanChange":
+        def _loads(raw: Any) -> dict[str, Any]:
+            if isinstance(raw, dict):
+                return raw
+            try:
+                return json.loads(str(raw or "{}"))
+            except (ValueError, TypeError):
+                return {}
+        return cls(
+            change_id=str(row.get("变更编号", "")),
+            batch_id=str(row.get("批次编号", "")),
+            target_site=str(row.get("目标站点", "")),
+            page_key=str(row.get("检测页面", "")),
+            change_type=str(row.get("变更类型", "")),
+            old_payload=_loads(row.get("旧内容摘要")),
+            new_payload=_loads(row.get("新内容摘要")),
+            snapshot_hash=str(row.get("扫描快照", "")),
+            detected_at=str(row.get("检测时间", "")),
+            status=str(row.get("status", "待确认")),
+        )
+
+
+@dataclass
+class ScanBatch:
+    """增量扫描批次确认记录：写差异、确认进度、断点续跑和下游消费共用同一份台账。"""
+    batch_id: str
+    target_site: str
+    cursor_id: str
+    source_job: str
+    start_cursor: str
+    end_cursor: str
+    snapshot_hash: str
+    input_snapshot: list[dict[str, Any]] = field(default_factory=list)
+    changes: list[ScanChange] = field(default_factory=list)
+    claim_count: int = 1
+    confirm_seq: int | None = None
+    confirmed_at: str = ""
+    consumed_at: str = ""
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    status: str = "待确认"
+
+    @property
+    def added_count(self) -> int:
+        return sum(1 for c in self.changes if c.change_type == SCAN_CHANGE_ADDED)
+
+    @property
+    def updated_count(self) -> int:
+        return sum(1 for c in self.changes if c.change_type == SCAN_CHANGE_UPDATED)
+
+    @property
+    def removed_count(self) -> int:
+        return sum(1 for c in self.changes if c.change_type == SCAN_CHANGE_REMOVED)
+
+    def to_row(self) -> dict[str, Any]:
+        return {
+            "批次编号": self.batch_id,
+            "目标站点": self.target_site,
+            "游标标记": self.cursor_id,
+            "来源作业": self.source_job,
+            "起始游标": self.start_cursor,
+            "续扫游标": self.end_cursor,
+            "扫描快照": self.snapshot_hash,
+            "输入快照": json.dumps(self.input_snapshot, ensure_ascii=False, sort_keys=True),
+            "认领次数": self.claim_count,
+            "新增数量": self.added_count,
+            "修改数量": self.updated_count,
+            "删除数量": self.removed_count,
+            "确认序号": self.confirm_seq if self.confirm_seq is not None else "",
+            "确认时间": self.confirmed_at,
+            "交付时间": self.consumed_at,
+            "检测时间": self.created_at,
+            "status": self.status,
+            "pending": self.status != "已消费",
+            "abnormal": False,
+        }
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any], changes: list[ScanChange] | None = None) -> "ScanBatch":
+        try:
+            seq_raw = row.get("确认序号")
+            seq = int(seq_raw) if seq_raw not in (None, "") else None
+        except (ValueError, TypeError):
+            seq = None
+        try:
+            snapshot = json.loads(str(row.get("输入快照") or "[]"))
+        except (ValueError, TypeError):
+            snapshot = []
+        return cls(
+            batch_id=str(row.get("批次编号", "")),
+            target_site=str(row.get("目标站点", "")),
+            cursor_id=str(row.get("游标标记", "")),
+            source_job=str(row.get("来源作业", "")),
+            start_cursor=str(row.get("起始游标", "")),
+            end_cursor=str(row.get("续扫游标", "")),
+            snapshot_hash=str(row.get("扫描快照", "")),
+            input_snapshot=snapshot if isinstance(snapshot, list) else [],
+            changes=list(changes or []),
+            claim_count=int(row.get("认领次数", 1) or 1),
+            confirm_seq=seq,
+            confirmed_at=str(row.get("确认时间", "")),
+            consumed_at=str(row.get("交付时间", "")),
+            created_at=str(row.get("检测时间", "")),
+            status=str(row.get("status", "待确认")),
         )
 
 

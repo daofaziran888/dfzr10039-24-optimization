@@ -343,46 +343,74 @@ def deliver_and_sample(batch: StorageBatch) -> tuple[DeliveryTask | None, Qualit
 def run_incremental_flow(cursor: IncrCursor,
                          previous_batch: StorageBatch | None,
                          current_data: list[CleanedContent]) -> DiffRecord | None:
-    """增量采集流程：比较增量游标与当前批次，生成差异检测记录。"""
+    """增量采集流程（兼容入口）：内部统一走扫描批次确认台账。
+
+    历史调用方仍拿到 ``DiffRecord`` 与游标推进效果，但写差异、确认进度
+    已经改为经由 ``ScanBatchService`` 的同一笔可追查批次确认记录：
+    认领写差异 → 确认推进游标并同步差异检测清单。
+    """
     if previous_batch is None or not previous_batch.records:
         return None
 
-    prev_fields = {r.source_url: r.fields for r in previous_batch.records}
-    curr_fields = {r.source_url: r.fields for r in current_data}
+    baseline_pages = [
+        {"page_key": record.source_url, "fields": dict(record.fields)}
+        for record in previous_batch.records
+    ]
+    current_pages = [
+        {"page_key": record.source_url, "fields": dict(record.fields)}
+        for record in current_data
+    ]
 
-    # 检测新增
-    new_urls = set(curr_fields) - set(prev_fields)
-    # 检测变更
-    changed_urls = {url for url in (set(curr_fields) & set(prev_fields))
-                    if curr_fields[url] != prev_fields[url]}
-    # 检测删除
-    removed_urls = set(prev_fields) - set(curr_fields)
-
-    total_changes = len(new_urls) + len(changed_urls) + len(removed_urls)
-    if total_changes == 0:
+    prev_keys = {item["page_key"] for item in baseline_pages}
+    curr_keys = {item["page_key"] for item in current_pages}
+    base_map = {item["page_key"]: item for item in baseline_pages}
+    curr_map = {item["page_key"]: item for item in current_pages}
+    new_urls = curr_keys - prev_keys
+    removed_urls = prev_keys - curr_keys
+    changed_urls = {
+        key for key in (curr_keys & prev_keys)
+        if curr_map[key]["fields"] != base_map[key]["fields"]
+    }
+    if not (new_urls or removed_urls or changed_urls):
         return None
 
-    diff = DiffRecord(
-        record_id=f"DIFF-{cursor.cursor_id}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+    from app.services.scan_batch import ScanBatchService
+
+    ledger = ScanBatchService()
+    batch = ledger.claim_scan(
         target_site=cursor.target_site,
-        page_url=",".join(list(new_urls | changed_urls)[:5]),
-        change_type=_classify_change_type(len(new_urls), len(changed_urls), len(removed_urls)),
-        old_summary=f"原{len(prev_fields)}条记录",
-        new_summary=f"新{len(curr_fields)}条记录，新增{len(new_urls)}变更{len(changed_urls)}删除{len(removed_urls)}",
-        affected_fields=list(curr_fields[next(iter(curr_fields))]) if curr_fields else [],
+        cursor_id=cursor.cursor_id,
+        pages=current_pages,
+        source_job=previous_batch.source_job_id,
+        baseline_pages=baseline_pages,
     )
+    ledger.confirm_batch(batch.batch_id)
+    batch = ledger.get_batch(batch.batch_id)
+    assert batch is not None
 
-    _persist_diff(diff)
-
-    # 更新游标
-    cursor.new_count = len(new_urls)
-    cursor.updated_count = len(changed_urls)
+    # 兼容旧的内存游标对象：台账已落库，这里同步调用方持有的对象
+    cursor.new_count = batch.added_count
+    cursor.updated_count = batch.updated_count
     cursor.last_cursor = cursor.current_cursor
-    cursor.current_cursor = datetime.now(timezone.utc).isoformat()
-    cursor.last_sync = cursor.current_cursor
+    cursor.current_cursor = batch.end_cursor
+    cursor.last_sync = batch.end_cursor
     cursor.status = "已追上"
 
-    return diff
+    return DiffRecord(
+        record_id=batch.changes[0].change_id if batch.changes else batch.batch_id,
+        target_site=cursor.target_site,
+        page_url=",".join(list(new_urls | changed_urls)[:5]),
+        change_type=_classify_change_type(
+            batch.added_count, batch.updated_count, batch.removed_count),
+        old_summary=f"原{len(prev_keys)}条记录",
+        new_summary=(
+            f"新{len(curr_keys)}条记录，新增{batch.added_count}"
+            f"变更{batch.updated_count}删除{batch.removed_count}"
+        ),
+        affected_fields=list(curr_map[next(iter(curr_map))]["fields"]) if curr_map else [],
+        batch_id=batch.batch_id,
+        snapshot_hash=batch.snapshot_hash,
+    )
 
 
 def _classify_change_type(new_count: int, changed_count: int, removed_count: int) -> str:
@@ -628,18 +656,6 @@ def _persist_sample(qs: QualitySample) -> None:
         "偏差阈值": str(qs.deviation_threshold), "最近采样": qs.last_sampled,
         "status": qs.status, "pending": False,
         "abnormal": qs.status == "偏差告警",
-    })
-
-
-def _persist_diff(diff: DiffRecord) -> None:
-    rows = store.rows("diff_check")
-    rows.append({
-        "id": max((int(r.get("id", 0)) for r in rows), default=0) + 1,
-        "记录编号": diff.record_id, "目标站点": diff.target_site,
-        "检测页面": diff.page_url, "变更类型": diff.change_type,
-        "旧内容摘要": diff.old_summary, "新内容摘要": diff.new_summary,
-        "影响字段": ",".join(diff.affected_fields), "检测时间": diff.detected_at,
-        "status": diff.status, "pending": False, "abnormal": False,
     })
 
 
